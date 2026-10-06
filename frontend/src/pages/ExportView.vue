@@ -32,7 +32,7 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { fitRatingGroup, inferTrends } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -71,14 +71,29 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
+  // 老备份（v3 以前，点据无 trend 字段）按时间补水势方向，保证分线定线可算
+  const needsInfer = payload.ratings.some((rating) => rating.trend !== 'rise' && rating.trend !== 'fall')
+  if (needsInfer) {
+    const inferred = inferTrends(payload.ratings)
+    payload.ratings.forEach((rating) => {
+      if (rating.trend !== 'rise' && rating.trend !== 'fall') {
+        rating.trend = inferred.get(rating.id) ?? 'rise'
+        rating.trendInferred = true
+      }
+    })
+  }
+  const pairKeys = Array.from(new Set(payload.ratings.map((rating) => `${rating.stationId}|${rating.lineNo}`)))
+  const fits = pairKeys.flatMap((key) => {
+    const [stationId, lineNo] = key.split('|')
+    const group = fitRatingGroup(
+      stationId,
+      lineNo,
       payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
+        .filter((rating) => rating.stationId === stationId && rating.lineNo === lineNo)
+        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, trend: rating.trend }))
     )
-  )
+    return [group.rise, group.fall]
+  })
   conclusions.value = buildConclusionLines(payload, fits)
 }
 
@@ -149,10 +164,10 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  await ratingStore.rebuildCompares()
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success('已按涨 / 落支线重新定线并刷新结构版本信息')
 }
 
 onMounted(() => {
@@ -234,7 +249,7 @@ onMounted(() => {
             <el-icon><Warning /></el-icon> {{ overLimitRows.length }} 条超限
           </el-tag>
         </h3>
-        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%</span>
+        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，按点据所属涨 / 落支线计算，限值 {{ ratingStore.deviationLimitPct }}%</span>
       </div>
 
       <EmptyPanel
@@ -253,6 +268,14 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="支线" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.trend" size="small" :type="row.trend === 'rise' ? 'primary' : 'warning'" effect="plain">
+              {{ row.trend === 'rise' ? '涨水' : '落水' }}
+            </el-tag>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
@@ -265,16 +288,18 @@ onMounted(() => {
         </el-table-column>
         <el-table-column label="曲线流量" width="130" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.compare.curveFlow.toFixed(1) }}</span>
+            <span class="gb-mono">{{ row.compare.verdict === '未定线' ? '—' : row.compare.curveFlow.toFixed(1) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="偏差判定" width="210">
           <template #default="{ row }">
             <DeviationTag
+              v-if="row.compare.verdict !== '未定线'"
               :deviation-pct="row.compare.deviationPct"
               :verdict="row.compare.verdict"
               :limit="ratingStore.deviationLimitPct"
             />
+            <el-tag v-else size="small" type="info" effect="plain">支线未定线</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="compare.operator" label="比测人" width="100" />

@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { inferTrends, type Rating, type RatingTrend } from '@/types/rating'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -82,6 +83,34 @@ export function countPayload(payload: BackupPayload): CountMap {
   }
 }
 
+/**
+ * 归一化老备份（v3 以前）：关系点据缺失 trend 字段时，按时间（同测站同定线号
+ * 内洪峰前涨、峰后落）补水势方向并标记 trendInferred；比测记录同步补 trend、
+ * 清掉与新支线模型不一致的曲线流量 / 判定，交由重新定线重算。
+ */
+export function normalizeBranchFields(payload: BackupPayload): BackupPayload {
+  const needsInfer = payload.ratings.some((rating) => rating.trend !== 'rise' && rating.trend !== 'fall')
+  let inferred: Map<string, RatingTrend> | null = null
+  if (needsInfer) inferred = inferTrends(payload.ratings)
+  const trendById = new Map<string, RatingTrend>()
+  payload.ratings = payload.ratings.map((rating) => {
+    let trend: RatingTrend = rating.trend === 'rise' || rating.trend === 'fall' ? rating.trend : 'rise'
+    let trendInferred = rating.trendInferred === true
+    if (inferred && rating.trend !== 'rise' && rating.trend !== 'fall') {
+      trend = inferred.get(rating.id) ?? 'rise'
+      trendInferred = true
+    }
+    trendById.set(rating.id, trend)
+    const next: Rating = { ...rating, trend, trendInferred }
+    return next
+  })
+  payload.compares = payload.compares.map((compare) => {
+    const trend = trendById.get(compare.ratingId) ?? compare.trend ?? 'rise'
+    return { ...compare, trend }
+  })
+  return payload
+}
+
 /** 导出 JSON 文件到浏览器下载目录 */
 export async function exportBackupJson(): Promise<{ fileName: string; counts: CountMap }> {
   const payload = await buildBackupPayload()
@@ -113,6 +142,7 @@ export function readFileText(file: File): Promise<string> {
 
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
+  normalizeBranchFields(payload)
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
@@ -186,8 +216,19 @@ export interface ConclusionLine {
 
 export function buildConclusionLines(
   payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
+  fits: Array<{
+    stationId: string
+    lineNo: string
+    trend: RatingTrend
+    valid: boolean
+    a: number
+    b: number
+    h0: number
+    meanResidualPct: number
+    sampleCount: number
+  }>
 ): ConclusionLine[] {
+  const branchLabel: Record<RatingTrend, string> = { rise: '涨', fall: '落' }
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
     const latest = sections.reduce<number | null>((acc, section) => {
@@ -199,12 +240,16 @@ export function buildConclusionLines(
     const overLimitCount = payload.compares.filter(
       (compare) => ratingIds.has(compare.ratingId) && compare.verdict === '超限'
     ).length
-    const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
-    const fitParts = lines.map((lineNo) => {
-      const fit = fits.find((item) => item.lineNo === lineNo)
-      if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
-    })
+    const lineKeys = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
+    const fitParts = lineKeys.flatMap((lineNo) =>
+      (['rise', 'fall'] as RatingTrend[]).map((trend) => {
+        const fit = fits.find(
+          (item) => item.stationId === station.id && item.lineNo === lineNo && item.trend === trend
+        )
+        if (!fit || !fit.valid) return `${lineNo}线${branchLabel[trend]}支未定线`
+        return `${lineNo}线${branchLabel[trend]} Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      })
+    )
     return {
       stationId: station.id,
       stationName: station.name,

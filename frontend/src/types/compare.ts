@@ -1,7 +1,7 @@
-import type { Rating } from './rating'
+import type { Rating, RatingTrend } from './rating'
 
-/** 比测判定结论 */
-export type CompareVerdict = '合格' | '超限'
+/** 比测判定结论：支线未定线时不参与合格 / 超限判定 */
+export type CompareVerdict = '合格' | '超限' | '未定线'
 
 /** 比测偏差允许限值（%）：超过则判定超限并挂红 */
 export const DEVIATION_LIMIT_PCT = 8
@@ -13,12 +13,14 @@ export interface Compare {
   ratingId: string
   /** 实测流量（m³/s） */
   measuredFlow: number
-  /** 曲线流量（m³/s） */
+  /** 曲线流量（m³/s，取所属支线定线成果；支线未定线时为 0） */
   curveFlow: number
   /** 偏差（%）：(曲线 - 实测) / 实测 × 100 */
   deviationPct: number
-  /** 合格 / 超限 */
+  /** 合格 / 超限 / 未定线 */
   verdict: CompareVerdict
+  /** 所属水势支线（涨水 / 落水） */
+  trend: RatingTrend
   /** 比测人 */
   operator: string
   /** 比测日期 */
@@ -27,7 +29,7 @@ export interface Compare {
   updatedAt: number
 }
 
-/** 按偏差计算判定结论 */
+/** 按偏差计算判定结论（支线已定线时使用） */
 export function judgeDeviation(deviationPct: number, limit = DEVIATION_LIMIT_PCT): CompareVerdict {
   return Math.abs(deviationPct) > limit ? '超限' : '合格'
 }
@@ -44,4 +46,5 @@ export interface CompareRow {
   rating: Rating | null
   stationName: string
   lineNo: string
+  trend: RatingTrend | null
 }

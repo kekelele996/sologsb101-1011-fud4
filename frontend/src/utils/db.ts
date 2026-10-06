@@ -13,11 +13,11 @@ import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
-import { fitPowerCurve } from '@/types/rating'
+import { curveFlow, fitRatingGroup, inferTrends, type RatingTrend } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -94,6 +94,63 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：关系点据按涨水 / 落水两条支线分别定线形成绳套
+    this.version(DB_VERSION)
+      .stores({
+        ratings: 'id, stationId, lineNo, trend, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, trend, deviationPct, comparedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 无归属老点据按时间补水势方向：同测站同定线号内以洪峰为界，前涨后落
+        const oldRatings = await tx.table<Rating, string>('ratings').toArray()
+        const inferred = inferTrends(oldRatings)
+        await tx
+          .table('ratings')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.trend !== 'rise' && row.trend !== 'fall') {
+              row.trend = inferred.get(String(row.id)) ?? 'rise'
+              row.trendInferred = true
+            }
+          })
+
+        // 老比测按所属支线重算曲线流量、偏差与判定；支线不足 3 点的标未定线
+        const ratings = await tx.table<Rating, string>('ratings').toArray()
+        const groupKeys = new Set(ratings.map((rating) => `${rating.stationId}|${rating.lineNo}`))
+        const fitByBranch = new Map<string, ReturnType<typeof fitRatingGroup>['rise']>()
+        groupKeys.forEach((key) => {
+          const [stationId, lineNo] = key.split('|')
+          const group = fitRatingGroup(
+            stationId,
+            lineNo,
+            ratings
+              .filter((rating) => rating.stationId === stationId && rating.lineNo === lineNo)
+              .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, trend: rating.trend }))
+          )
+          fitByBranch.set(`${key}|rise`, group.rise)
+          fitByBranch.set(`${key}|fall`, group.fall)
+        })
+        await tx
+          .table('compares')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            const rating = ratings.find((item) => item.id === row.ratingId)
+            if (!rating) return
+            const fit = fitByBranch.get(`${rating.stationId}|${rating.lineNo}|${rating.trend}`)
+            row.trend = rating.trend
+            if (fit?.valid) {
+              const predicted = curveFlow(fit, rating.stageM)
+              row.curveFlow = predicted
+              row.deviationPct = calcDeviationPct(rating.flowM3s, predicted)
+              row.verdict = judgeDeviation(Number(row.deviationPct))
+            } else {
+              row.curveFlow = 0
+              row.deviationPct = 0
+              row.verdict = '未定线'
+            }
+          })
       })
   }
 }
@@ -269,22 +326,43 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
-  // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
+  // 水位流量关系点据：A 线为龙门站主定线（涨 5 落 4 成绳套），B 线为青矶站定线
+  // （落水仅 1 点，演示支线未定线），C 线为白沙滩比测定线（涨落各 7 点，
+  // c4 / c11 为异常偏大点据，用于演示分支线超限挂红与偏差分析）
   const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
-    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
-    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
-    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
-    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
-    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
-    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
-    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
-    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
-    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
-    // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析
-    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
-    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
-    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
-    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
+    // A 线 · 涨水支线（洪峰 7.03 m 之前）
+    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', trend: 'rise', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
+    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', trend: 'rise', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
+    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', trend: 'rise', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
+    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', trend: 'rise', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
+    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', trend: 'rise', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
+    // A 线 · 落水支线（同水位流量低于涨水，绳套顺时针）
+    { id: 'rat_lh_a6', stationId: 'stn_lh01', stageM: 6.4, flowM3s: 346.0, lineNo: 'A', trend: 'fall', measureNo: '2024-09-001', measuredAt: '2024-09-04T09:00:00.000Z' },
+    { id: 'rat_lh_a7', stationId: 'stn_lh01', stageM: 5.7, flowM3s: 247.0, lineNo: 'A', trend: 'fall', measureNo: '2024-09-002', measuredAt: '2024-09-18T09:00:00.000Z' },
+    { id: 'rat_lh_a8', stationId: 'stn_lh01', stageM: 4.95, flowM3s: 172.4, lineNo: 'A', trend: 'fall', measureNo: '2024-10-001', measuredAt: '2024-10-09T08:30:00.000Z' },
+    { id: 'rat_lh_a9', stationId: 'stn_lh01', stageM: 4.3, flowM3s: 118.6, lineNo: 'A', trend: 'fall', measureNo: '2024-10-002', measuredAt: '2024-10-30T08:30:00.000Z' },
+    // B 线 · 涨水 4 点可定线，落水仅 1 点 → 落水支线未定线
+    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', trend: 'rise', measureNo: '2024-05-001', measuredAt: '2024-05-11T07:30:00.000Z' },
+    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', trend: 'rise', measureNo: '2024-05-003', measuredAt: '2024-06-20T07:50:00.000Z' },
+    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', trend: 'rise', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
+    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', trend: 'rise', measureNo: '2024-07-004', measuredAt: '2024-07-25T06:40:00.000Z' },
+    { id: 'rat_qj_b5', stationId: 'stn_qj02', stageM: 3.55, flowM3s: 61.0, lineNo: 'B', trend: 'fall', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
+    // C 线 · 涨水支线（c4 异常偏大，超 8% 限值）
+    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 149.5, lineNo: 'C', trend: 'rise', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
+    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.15, flowM3s: 183.7, lineNo: 'C', trend: 'rise', measureNo: '2024-06-002', measuredAt: '2024-06-05T09:00:00.000Z' },
+    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.4, flowM3s: 218.8, lineNo: 'C', trend: 'rise', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
+    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 5.65, flowM3s: 331.2, lineNo: 'C', trend: 'rise', measureNo: '2024-07-003', measuredAt: '2024-07-02T09:30:00.000Z' },
+    { id: 'rat_bs_c5', stationId: 'stn_bs03', stageM: 5.9, flowM3s: 291.5, lineNo: 'C', trend: 'rise', measureNo: '2024-07-006', measuredAt: '2024-07-10T09:30:00.000Z' },
+    { id: 'rat_bs_c6', stationId: 'stn_bs03', stageM: 6.2, flowM3s: 336.4, lineNo: 'C', trend: 'rise', measureNo: '2024-07-009', measuredAt: '2024-07-18T09:30:00.000Z' },
+    { id: 'rat_bs_c7', stationId: 'stn_bs03', stageM: 6.55, flowM3s: 390.0, lineNo: 'C', trend: 'rise', measureNo: '2024-07-012', measuredAt: '2024-07-25T09:30:00.000Z' },
+    // C 线 · 落水支线（c11 异常偏大，超 8% 限值；同水位流量低于涨水成绳套）
+    { id: 'rat_bs_c8', stationId: 'stn_bs03', stageM: 6.35, flowM3s: 336.7, lineNo: 'C', trend: 'fall', measureNo: '2024-08-001', measuredAt: '2024-08-02T09:40:00.000Z' },
+    { id: 'rat_bs_c9', stationId: 'stn_bs03', stageM: 6.1, flowM3s: 299.7, lineNo: 'C', trend: 'fall', measureNo: '2024-08-002', measuredAt: '2024-08-09T09:40:00.000Z' },
+    { id: 'rat_bs_c10', stationId: 'stn_bs03', stageM: 5.85, flowM3s: 263.6, lineNo: 'C', trend: 'fall', measureNo: '2024-08-003', measuredAt: '2024-08-16T09:40:00.000Z' },
+    { id: 'rat_bs_c11', stationId: 'stn_bs03', stageM: 5.6, flowM3s: 296.8, lineNo: 'C', trend: 'fall', measureNo: '2024-08-004', measuredAt: '2024-08-23T09:40:00.000Z' },
+    { id: 'rat_bs_c12', stationId: 'stn_bs03', stageM: 5.35, flowM3s: 194.0, lineNo: 'C', trend: 'fall', measureNo: '2024-08-005', measuredAt: '2024-08-30T09:40:00.000Z' },
+    { id: 'rat_bs_c13', stationId: 'stn_bs03', stageM: 5.1, flowM3s: 160.7, lineNo: 'C', trend: 'fall', measureNo: '2024-09-002', measuredAt: '2024-09-08T09:40:00.000Z' },
+    { id: 'rat_bs_c14', stationId: 'stn_bs03', stageM: 4.85, flowM3s: 128.7, lineNo: 'C', trend: 'fall', measureNo: '2024-09-003', measuredAt: '2024-09-16T09:40:00.000Z' }
   ]
 
   await db.transaction(
@@ -316,26 +394,38 @@ export async function seedDemoData(): Promise<void> {
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
+      // 比测记录：曲线流量按所属支线的定线成果计算偏差与判定；
+      // 支线不足 3 点（如 B 线落水）时 curveFlow=0、判定为未定线，保证与页面展示一致
       const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
-      ratingSeeds.forEach((rating) => {
-        const list = lineGroups.get(rating.lineNo) ?? []
-        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
-        lineGroups.set(rating.lineNo, list)
+      const groupKeys = new Set(ratingSeeds.map((rating) => `${rating.stationId}|${rating.lineNo}`))
+      const fitByBranch = new Map<string, { valid: boolean; a: number; b: number; h0: number }>()
+      groupKeys.forEach((key) => {
+        const [stationId, lineNo] = key.split('|')
+        const group = fitRatingGroup(
+          stationId,
+          lineNo,
+          ratingSeeds
+            .filter((rating) => rating.stationId === stationId && rating.lineNo === lineNo)
+            .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, trend: rating.trend }))
+        )
+        fitByBranch.set(`${key}|rise`, group.rise)
+        fitByBranch.set(`${key}|fall`, group.fall)
       })
       ratingSeeds.forEach((rating) => {
-        const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
-        if (!fit.valid) return
-        const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
-        const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
+        const fit = fitByBranch.get(`${rating.stationId}|${rating.lineNo}|${rating.trend}`)
+        const valid = fit?.valid ?? false
+        const predicted = valid && fit
+          ? round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
+          : 0
+        const deviationPct = valid ? calcDeviationPct(rating.flowM3s, predicted) : 0
         compares.push({
           id: `cmp_${rating.id}`,
           ratingId: rating.id,
           measuredFlow: rating.flowM3s,
           curveFlow: predicted,
           deviationPct,
-          verdict: judgeDeviation(deviationPct),
+          verdict: valid ? judgeDeviation(deviationPct) : '未定线',
+          trend: rating.trend,
           operator: rating.lineNo === 'C' ? '周渝' : '林昭',
           comparedAt: rating.measuredAt,
           createdAt: now,
@@ -351,6 +441,7 @@ export async function seedDemoData(): Promise<void> {
           curveFlow: 100.2,
           deviationPct: calcDeviationPct(97.5, 100.2),
           verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
+          trend: 'rise' as RatingTrend,
           operator: '林昭',
           comparedAt: iso,
           createdAt: now,
