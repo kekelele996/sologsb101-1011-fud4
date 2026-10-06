@@ -32,7 +32,7 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { LIMB_LABELS, fitLoopCurve, type RatingLimb } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -48,6 +48,9 @@ const exporting = ref(false)
 
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
+
+/** 支线中文名（表格行数据为 any，经函数入参收窄类型） */
+const limbLabel = (limb: RatingLimb): string => LIMB_LABELS[limb]
 
 /** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
 const conclusions = ref<
@@ -71,15 +74,15 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
+  const loops = ratingStore.lineNos.map((lineNo) =>
+    fitLoopCurve(
       payload.ratings
         .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, limb: rating.limb })),
       lineNo
     )
   )
-  conclusions.value = buildConclusionLines(payload, fits)
+  conclusions.value = buildConclusionLines(payload, loops)
 }
 
 async function handleExport(): Promise<void> {
@@ -251,6 +254,14 @@ onMounted(() => {
         <el-table-column label="定线号" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="支线" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.rating" size="small" effect="plain" :type="row.rating.limb === 'rising' ? 'warning' : 'primary'">
+              {{ limbLabel(row.rating.limb) }}
+            </el-tag>
+            <span v-else>—</span>
           </template>
         </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">

@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { LIMB_LABELS, fillMissingLimbs, type LoopFitResult } from '@/types/rating'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -111,9 +112,10 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
-/** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
+/** 导入快照：overwrite=true 先清空全部表，否则按主键合并；老备份中无涨落归属的点据按时间补方向 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
+  const ratings = fillMissingLimbs(payload.ratings)
   await db.transaction(
     'rw',
     [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
@@ -122,7 +124,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.sections.bulkPut(payload.sections)
       await db.verticals.bulkPut(payload.verticals)
       await db.points.bulkPut(payload.points)
-      await db.ratings.bulkPut(payload.ratings)
+      await db.ratings.bulkPut(ratings)
       await db.compares.bulkPut(payload.compares)
     }
   )
@@ -170,7 +172,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
 }
 
 /**
- * 生成结论文本：按测站输出最新水位、断面测次、定线参数与超限点据。
+ * 生成结论文本：按测站输出最新水位、断面测次、绳套定线参数（涨落支线）与超限点据。
  * 供导出页的「检测结论」区域使用。
  */
 export interface ConclusionLine {
@@ -184,10 +186,7 @@ export interface ConclusionLine {
   fitText: string
 }
 
-export function buildConclusionLines(
-  payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
-): ConclusionLine[] {
+export function buildConclusionLines(payload: BackupPayload, loops: LoopFitResult[]): ConclusionLine[] {
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
     const latest = sections.reduce<number | null>((acc, section) => {
@@ -200,10 +199,14 @@ export function buildConclusionLines(
       (compare) => ratingIds.has(compare.ratingId) && compare.verdict === '超限'
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
+    const limbText = (fit: LoopFitResult['rising']): string =>
+      fit.valid
+        ? `${LIMB_LABELS[fit.limb]} Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+        : `${LIMB_LABELS[fit.limb]}未定线（${fit.sampleCount} 点）`
     const fitParts = lines.map((lineNo) => {
-      const fit = fits.find((item) => item.lineNo === lineNo)
-      if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      const loop = loops.find((item) => item.lineNo === lineNo)
+      if (!loop || !loop.valid) return `${lineNo} 线未定线（涨落支线点据均不足）`
+      return `${lineNo} 线[共用基线 H0=${loop.h0}] ${limbText(loop.rising)}；${limbText(loop.falling)}`
     })
     return {
       stationId: station.id,

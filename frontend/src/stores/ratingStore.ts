@@ -1,5 +1,6 @@
 /**
  * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值。
+ * 涨、落两条支线分别定线（共用基线 H0），点据的曲线流量 / 残差 / 比测按所属支线计算。
  * 供关系点据页（/ratings）与导出页（/export）共用。
  */
 import { defineStore } from 'pinia'
@@ -7,8 +8,15 @@ import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Compare } from '@/types/compare'
 import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
-import type { Rating, RatingFitResult } from '@/types/rating'
-import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import type { LoopFitResult, Rating } from '@/types/rating'
+import {
+  LIMB_LABELS,
+  createEmptyRatingFilter,
+  curveFlow,
+  fillMissingLimbs,
+  fitLoopCurve,
+  type RatingFilterState
+} from '@/types/rating'
 import type { Station } from '@/types/station'
 
 export const useRatingStore = defineStore('rating', () => {
@@ -18,9 +26,9 @@ export const useRatingStore = defineStore('rating', () => {
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
-  /** 当前定线号与定线参数（跨页保留） */
+  /** 当前定线号与绳套定线参数（跨页保留） */
   const activeLineNo = ref<string>('A')
-  const fits = ref<RatingFitResult[]>([])
+  const fits = ref<LoopFitResult[]>([])
   const deviationLimitPct = ref<number>(DEVIATION_LIMIT_PCT)
 
   let started = false
@@ -29,7 +37,8 @@ export const useRatingStore = defineStore('rating', () => {
     if (started) return
     started = true
     watchTable<Rating>(() => db.ratings).subscribe((rows) => {
-      ratings.value = rows
+      // 老数据可能没有涨落归属，按时间顺序补方向（迁移与导入已处理，这里兜底）
+      ratings.value = fillMissingLimbs(rows)
       ready.value = true
       error.value = null
     })
@@ -50,33 +59,34 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
-  const allFits = computed<RatingFitResult[]>(() =>
+  /** 逐定线号的绳套拟合结果（涨、落支线共用基线、分别拟合） */
+  const allLoopFits = computed<LoopFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
       const points = ratings.value
         .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-      return fitPowerCurve(points, lineNo)
+        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, limb: rating.limb }))
+      return fitLoopCurve(points, lineNo)
     })
   )
 
-  const activeFit = computed<RatingFitResult>(() => {
+  const activeLoopFit = computed<LoopFitResult>(() => {
     const cached = fits.value.find((fit) => fit.lineNo === activeLineNo.value)
     if (cached) return cached
-    const computedFit = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
+    const computedFit = allLoopFits.value.find((fit) => fit.lineNo === activeLineNo.value)
     if (computedFit) return computedFit
-    return fitPowerCurve([], activeLineNo.value)
+    return fitLoopCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 所属支线的曲线流量 + 残差 */
   const pointRows = computed(() =>
     ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
+        const limbFit = rating.limb === 'rising' ? activeLoopFit.value.rising : activeLoopFit.value.falling
+        const predicted = limbFit.valid ? curveFlow(limbFit, rating.stageM) : 0
         const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
+          limbFit.valid && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
         return { rating, predicted, residualPct }
@@ -88,7 +98,7 @@ export const useRatingStore = defineStore('rating', () => {
     ratings.value.filter((rating) => {
       const keyword = filter.value.keyword.trim()
       if (keyword.length > 0) {
-        const haystack = `${rating.measureNo}${rating.lineNo}${stationNameOf(rating.stationId)}`
+        const haystack = `${rating.measureNo}${rating.lineNo}${LIMB_LABELS[rating.limb]}${stationNameOf(rating.stationId)}`
         if (!haystack.includes(keyword)) return false
       }
       if (filter.value.stationIds.length > 0 && !filter.value.stationIds.includes(rating.stationId)) return false
@@ -128,9 +138,9 @@ export const useRatingStore = defineStore('rating', () => {
     compareRows.value.filter((row) => row.compare.verdict === '超限')
   )
 
-  /** 定线质量派生值：平均残差与合格点占比 */
+  /** 定线质量派生值：平均残差与合格点占比（按各定线号可定线支线统计） */
   const fitQuality = computed(() => {
-    const valid = allFits.value.filter((fit) => fit.valid)
+    const valid = allLoopFits.value.filter((fit) => fit.valid)
     const meanResidual = valid.length
       ? Number((valid.reduce((sum, fit) => sum + fit.meanResidualPct, 0) / valid.length).toFixed(2))
       : 0
@@ -157,7 +167,7 @@ export const useRatingStore = defineStore('rating', () => {
     activeLineNo.value = lineNo
   }
 
-  function setFit(fit: RatingFitResult): void {
+  function setFit(fit: LoopFitResult): void {
     const others = fits.value.filter((item) => item.lineNo !== fit.lineNo)
     fits.value = [...others, fit]
   }
@@ -187,26 +197,31 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
+   * 由点据生成 / 刷新比测记录：曲线流量取点据所属支线（涨水 / 落水）的拟合值，
    * 偏差超过限值自动判定超限并进入分析清单。
+   * 支线未定线（点据不足 3 个）的点据不参与比测，其旧比测记录一并清除，
+   * 不借用另一条支线的参数顶算。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
-    const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    const loop = fitLoopCurve(
+      targets.map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s, limb: rating.limb })),
       targetLine
     )
-    setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    setFit(loop)
     if (targets.length === 0) return 0
     const now = Date.now()
-    const rows: Compare[] = targets.map((rating) => {
-      const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
+    const rows: Compare[] = []
+    const keptRatingIds = new Set<string>()
+    targets.forEach((rating) => {
+      const limbFit = rating.limb === 'rising' ? loop.rising : loop.falling
+      if (!limbFit.valid) return
+      const predicted = curveFlow(limbFit, rating.stageM)
       const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
       const existing = compares.value.find((item) => item.ratingId === rating.id)
-      return {
+      keptRatingIds.add(rating.id)
+      rows.push({
         id: existing?.id ?? createId('cmp'),
         ratingId: rating.id,
         measuredFlow: rating.flowM3s,
@@ -217,9 +232,16 @@ export const useRatingStore = defineStore('rating', () => {
         comparedAt: existing?.comparedAt ?? rating.measuredAt,
         createdAt: existing?.createdAt ?? now,
         updatedAt: now
-      }
+      })
     })
-    await db.compares.bulkPut(rows)
+    const targetIds = new Set(targets.map((rating) => rating.id))
+    const staleIds = compares.value
+      .filter((compare) => targetIds.has(compare.ratingId) && !keptRatingIds.has(compare.ratingId))
+      .map((compare) => compare.id)
+    await db.transaction('rw', [db.compares], async () => {
+      if (staleIds.length > 0) await db.compares.bulkDelete(staleIds)
+      if (rows.length > 0) await db.compares.bulkPut(rows)
+    })
     return rows.length
   }
 
@@ -261,11 +283,11 @@ export const useRatingStore = defineStore('rating', () => {
     error,
     filter,
     activeLineNo,
-    activeFit,
+    activeLoopFit,
     fits,
     deviationLimitPct,
     lineNos,
-    allFits,
+    allLoopFits,
     pointRows,
     filteredRatings,
     hasFilter,
